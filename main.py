@@ -26,8 +26,7 @@ PLANT_PINS = [
     # {"led": 8, "adc": 3, "pump": 9},   # Plant 4: GP8, ADC3, GP9
 ]
 USER_BUTTON  = Pin(36, Pin.IN, Pin.PULL_UP)
-soil_adc = ADC(Pin(44))        # create an ADC object acting on the soil sensor pin
-val = soil_adc.read_u16()  # read a raw analog value in the range 0-65535
+SOIL_ADCs = [ADC(Pin(44)), ADC(Pin(45)) ]       # create ADC objects acting on the soil sensor pins
 
 # --- Initialize hardware for all plants ---
 leds = [Pin(p["led"], Pin.OUT) for p in PLANT_PINS]
@@ -53,10 +52,16 @@ def create_ap():
     print('IP Address:', ap.ifconfig()[0])
     return ap
 
-
-def autonomous_btn_click():
-    pass
-    
+def _send_json(sock, obj, code=200):
+    import json
+    body = json.dumps(obj).encode()
+    hdr = (
+        f"HTTP/1.1 {code} OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    sock.send(hdr + body)    
 
 def generate_html():
     html = """<!DOCTYPE html>
@@ -86,29 +91,7 @@ def generate_html():
             <header>Plant 1</header>
             <div class="attribute">
                 <p>Soil moisture:</p>
-                <input class="text-box" type="text" readonly>
-            </div>
-            <div class="attribute">
-                <p>Pump for:</p>
-                <input id="pump0" class="text-box" type="text">
-                <button class="start-btn" onclick="runPump(0)">Start</button>
-            </div>
-            <div class="attribute">
-                <p>Moisture threshold:</p>
-                <input class="text-box" type="text">
-                <button class="apply-btn">Apply</button>
-            </div>
-            <div class="attribute">
-                <p>Water seconds:</p>
-                <input class="text-box" type="text">
-                <button class="apply-btn">Apply</button>
-            </div>
-        </div>
-        <div class="plant-box">
-            <header>Plant 2</header>
-            <div class="attribute">
-                <p>Soil moisture:</p>
-                <input class="text-box" type="text" readonly>
+                <input id="soil-field1" class="text-box" type="text" readonly>
             </div>
             <div class="attribute">
                 <p>Pump for:</p>
@@ -117,13 +100,35 @@ def generate_html():
             </div>
             <div class="attribute">
                 <p>Moisture threshold:</p>
-                <input class="text-box" type="text">
-                <button class="apply-btn">Apply</button>
+                <input id="threshold1" class="text-box" type="text">
+                <button class="apply-btn" onclick="applyThreshold(1)">Apply</button>
             </div>
             <div class="attribute">
                 <p>Water seconds:</p>
-                <input class="text-box" type="text">
-                <button class="apply-btn">Apply</button>
+                <input id="water1" class="text-box" type="text">
+                <button class="apply-btn" onclick="applyWater(1)">Apply</button>
+            </div>
+        </div>
+        <div class="plant-box">
+            <header>Plant 2</header>
+            <div class="attribute">
+                <p>Soil moisture:</p>
+                <input id="soil-field2" class="text-box" type="text" readonly>
+            </div>
+            <div class="attribute">
+                <p>Pump for:</p>
+                <input id="pump2" class="text-box" type="text">
+                <button class="start-btn" onclick="runPump(2)">Start</button>
+            </div>
+            <div class="attribute">
+                <p>Moisture threshold:</p>
+                <input id="threshold2" class="text-box" type="text">
+                <button class="apply-btn" onclick="applyThreshold(2)">Apply</button>
+            </div>
+            <div class="attribute">
+                <p>Water seconds:</p>
+                <input id="water2" class="text-box" type="text">
+                <button class="apply-btn" onclick="applyWater(2)">Apply</button>
             </div>
         </div>
     </div>
@@ -158,7 +163,6 @@ def generate_html():
                 } catch (e){
                     console.log("error setting moisture threhold:", e);
                 }
-
             }
 
             async function applyWater(i){
@@ -169,8 +173,23 @@ def generate_html():
                 } catch (e){
                     console.log("error setting water duration:", e);
                 }
-
             }
+
+            async function updateSoil(i){
+                try{
+                    const res = await fetch('/api/update_soil/' + i, { method: 'GET' });
+                    const json_res = await res.json();
+                    document.getElementById("soil-field" + i).value = json_res.raw;
+                } catch (e){
+                    console.log("error updating soil moisture: ", e)
+                }
+            }
+
+            setInterval(() => updateSoil(1), 1000);
+            setInterval(() => updateSoil(2), 1000);
+            updateSoil(1);
+            updateSoil(2);
+
         </script>
     </body>
     </html>"""
@@ -195,6 +214,19 @@ def handle_request(client_socket):
             client_socket.send(response.encode())
             return
 
+        #API: get soil moisture
+        if method == 'GET' and path.startswith('/api/update_soil/'):
+            try:
+                _, _, _, idx_str = path.split('/')
+                idx = int(idx_str)
+                if idx < 1 or idx > 2: raise ValueError('bad plant index')
+                raw_val = SOIL_ADCs[idx - 1].read_u16()
+                _send_json(client_socket, {"raw": raw_val})
+            except Exception as e:
+                print('error reading soil sensor', e)
+                client_socket.send(b'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nERR')
+            return
+            
         # API: pump
         if method == 'POST' and path.startswith('/api/pump/'):
             try:
@@ -203,13 +235,11 @@ def handle_request(client_socket):
                 idx = int(idx_str)
                 print(idx)
                 secs = float(sec_str)
-                if idx < 0 or idx > 1:
+                if idx < 1 or idx > 2:
                     raise ValueError('bad plant index')
-                
-                print("idx: ", idx)
 
-                motor = EncodedMotor.get_default_encoded_motor(idx+1)
-                print(idx)
+                motor = EncodedMotor.get_default_encoded_motor(idx)
+                print(motor)
                 motor.set_effort(1.0)
                 time.sleep(secs)
                 motor.set_effort(0.0)
@@ -241,7 +271,7 @@ def handle_request(client_socket):
                 idx = int(idx_str)
                 water_secs = float(val_str)
                 if idx < 1 or idx > 2: raise ValueError('bad plant index')
-                if secs < 0: raise ValueError('PLease enter non-negative seconds')
+                if water_secs < 0: raise ValueError('PLease enter non-negative seconds')
                 auto_water_seconds[idx-1] = water_secs
                 client_socket.send(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
             except Exception as e:
@@ -308,4 +338,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
