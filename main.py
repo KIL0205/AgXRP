@@ -26,6 +26,8 @@ PLANT_PINS = [
     # {"led": 8, "adc": 3, "pump": 9},   # Plant 4: GP8, ADC3, GP9
 ]
 USER_BUTTON  = Pin(36, Pin.IN, Pin.PULL_UP)
+soil_adc = ADC(Pin(44))        # create an ADC object acting on the soil sensor pin
+val = soil_adc.read_u16()  # read a raw analog value in the range 0-65535
 
 # --- Initialize hardware for all plants ---
 leds = [Pin(p["led"], Pin.OUT) for p in PLANT_PINS]
@@ -35,8 +37,6 @@ pumps = [Pin(p["pump"], Pin.OUT) for p in PLANT_PINS]
 # --- Global state for all plants ---
 led_states = [False] * 4
 adc_values = [0] * 4
-
-# motors = {}
 
 def create_ap():
     """Create WiFi Access Point"""
@@ -203,11 +203,13 @@ def handle_request(client_socket):
                 idx = int(idx_str)
                 print(idx)
                 secs = float(sec_str)
-                if idx < 1 or idx > 2:
+                if idx < 0 or idx > 1:
                     raise ValueError('bad plant index')
+                
+                print("idx: ", idx)
 
-                motor = EncodedMotor.get_default_encoded_motor(idx)
-                print(motor)
+                motor = EncodedMotor.get_default_encoded_motor(idx+1)
+                print(idx)
                 motor.set_effort(1.0)
                 time.sleep(secs)
                 motor.set_effort(0.0)
@@ -306,3 +308,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
