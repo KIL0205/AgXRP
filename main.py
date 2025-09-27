@@ -4,6 +4,7 @@ import machine
 import time
 from machine import Pin, ADC
 import gc
+import _thread
 from XRPLib.encoded_motor import EncodedMotor
 
 # Initialize hardware
@@ -17,6 +18,8 @@ adc_value = 0
 is_config_mode = False # False = autonomous | True = Config
 moisture_thresholds = [1000, 1000]
 auto_water_seconds = [3.0, 3.0]
+_server_socket_ref = None  # global so watcher can close it
+
 
 # --- Hardware Pin Assignments (update these for your wiring) ---
 PLANT_PINS = [
@@ -256,37 +259,68 @@ def handle_request(client_socket):
     finally:
         try: client_socket.close()
         except: pass
+        
+
+def _button_watcher():
+    global is_config_mode, _server_socket_ref
+    last = 1
+    pressed_count = 0
+    while True:
+        val = USER_BUTTON.value()  # 0 when pressed (pull-up)
+        if val == 0 and last == 1:
+            # simple debounce: wait ~50ms confirming
+            time.sleep(0.05)
+            if USER_BUTTON.value() == 0:
+                print("Button pressed -> leaving config mode")
+                is_config_mode = False
+                # Close the server socket to unblock accept()
+                try:
+                    if _server_socket_ref:
+                        _server_socket_ref.close()
+                except:
+                    pass
+        last = val
+        time.sleep(0.02)
 
 def start_webserver():
     """Start the web server"""
-    global is_config_mode
-    
+    global is_config_mode, _server_socket_ref
+
     addr = socket.getaddrinfo('0.0.0.0', 80)[0][-1]
     server_socket = socket.socket()
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(addr)
-    server_socket.listen(1)
-    
+    server_socket.listen(2)
+
+    _server_socket_ref = server_socket
+
     print('Web server started on port 80')
     print('Connect to PicoHotspot WiFi and visit: http://192.168.4.1')
-    
-    while True:
-        try:
-            client_socket, addr = server_socket.accept()
-            print(f'Client connected from {addr}')
-            handle_request(client_socket)
-            gc.collect()  # Garbage collection to prevent memory issues
-        except Exception as e:
-            print(f"Server error: {e}")
+
+    try:
+        while is_config_mode:
             try:
-                client_socket.close()
-            except:
-                pass
-            
-        if USER_BUTTON.value() == 0:
-            print("Exiting Configuration Mode")
-            is_config_mode = False
-            time.sleep(0.5)
-            break
+                client_socket, addr = server_socket.accept()  # may be unblocked by close()
+            except OSError as e:
+                # When closed from the watcher, accept() throws; exit loop
+                break
+
+            try:
+                print(f'Client connected from {addr}')
+                handle_request(client_socket)
+            finally:
+                try:
+                    client_socket.close()
+                except:
+                    pass
+
+            gc.collect()
+    finally:
+        try:
+            server_socket.close()
+        except:
+            pass
+        _server_socket_ref = None
             
 def config_mode():
     """Configuration mode"""
@@ -320,36 +354,29 @@ def autonomous_mode():
     
 
 def main():
-    """Main function"""
-    print("Starting Pico Web Server...")
     global is_config_mode
-    
-    print(USER_BUTTON.value())
-    
+
+    print("Starting Pico Web Server...")
+    # start watcher thread once
+    try:
+        _thread.start_new_thread(_button_watcher, ())
+    except:
+        print("Could not start _button_watcher thread; falling back to single-core.")
+
     while True:
         if USER_BUTTON.value() == 0:
             is_config_mode = True
-            time.sleep(0.5)
-            
+            time.sleep(0.2)  # debounce
+
         if is_config_mode:
             print("Entering Configuration Mode")
-            config_mode()
+            create_ap()
+            start_webserver()
         else:
             print("Entering Autonomous Mode")
             autonomous_mode()
-    
-    # while not is_config_mode:
-    #     if USER_BUTTON.value() == 0:
-    #         is_config_mode = True
-    #         time.sleep(0.5)
-
-    # Initialize all LEDs to OFF
-    for l in leds:
-        l.value(False)
-    
-#     m = EncodedMotor.get_default_encoded_motor(2)
-#     m.set_effort(0.8)
-#     time.sleep(10)
+            # brief sleep to avoid tight loop
+            time.sleep(0.1)
 
 if __name__ == '__main__':
     main()
