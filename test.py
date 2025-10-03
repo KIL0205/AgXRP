@@ -1,5 +1,6 @@
 import network
 import socket
+import machine
 import time
 from machine import Pin, ADC
 import gc
@@ -264,31 +265,25 @@ def _button_watcher():
     global is_config_mode, _server_socket_ref
     last = 1
     pressed_count = 0
-    
     while True:
-        print("USER_BUTTON value:", USER_BUTTON.value())
-        print("Is Config Mode:", is_config_mode)
         val = USER_BUTTON.value()  # 0 when pressed (pull-up)
         if val == 0 and last == 1:
             # simple debounce: wait ~50ms confirming
             time.sleep(0.05)
             if USER_BUTTON.value() == 0:
-                if is_config_mode:
-                    print("Button pressed -> leaving config mode")
-                    is_config_mode = False
-                    # Close the server socket to unblock accept()
-                    try:
-                        if _server_socket_ref:
-                            _server_socket_ref.close()
-                    except:
-                        pass
-                else:
-                    print("Button pressed -> entering config mode")
-                    is_config_mode = True
+                print("Button pressed -> leaving config mode")
+                is_config_mode = False
+                # Close the server socket to unblock accept()
+                try:
+                    if _server_socket_ref:
+                        _server_socket_ref.close()
+                except:
+                    pass
         last = val
         time.sleep(0.02)
 
 def start_webserver():
+    """Start the web server"""
     global is_config_mode, _server_socket_ref
 
     addr = socket.getaddrinfo('0.0.0.0', 80)[0][-1]
@@ -296,7 +291,7 @@ def start_webserver():
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(addr)
     server_socket.listen(2)
-    server_socket.settimeout(0.2)   # <<— key: short timeout so we can poll
+
     _server_socket_ref = server_socket
 
     print('Web server started on port 80')
@@ -305,24 +300,26 @@ def start_webserver():
     try:
         while is_config_mode:
             try:
-                client_socket, caddr = server_socket.accept()
-            except OSError:
-                # timeout OR socket was closed by watcher — check mode and continue/break
-                if not is_config_mode:
-                    break
-                continue
+                client_socket, addr = server_socket.accept()  # may be unblocked by close()
+            except OSError as e:
+                # When closed from the watcher, accept() throws; exit loop
+                break
 
             try:
-                print('Client connected from', caddr)
+                print(f'Client connected from {addr}')
                 handle_request(client_socket)
             finally:
-                try: client_socket.close()
-                except: pass
+                try:
+                    client_socket.close()
+                except:
+                    pass
 
             gc.collect()
     finally:
-        try: server_socket.close()
-        except: pass
+        try:
+            server_socket.close()
+        except:
+            pass
         _server_socket_ref = None
             
 def config_mode():
@@ -334,17 +331,10 @@ def config_mode():
 
     
     # Creates the access point
-    ap = create_ap()
+    create_ap()
     
     # Starts the web server
     start_webserver()
-    
-    try:
-        ap.active(False)      # tear down AP before returning to main
-        print("AP deactivated")
-    except:
-        pass
-    
     
 def autonomous_mode():
     """Autonomous mode"""
@@ -367,25 +357,28 @@ def main():
     global is_config_mode
 
     print("Starting Pico Web Server...")
+    # start watcher thread once
     try:
         _thread.start_new_thread(_button_watcher, ())
     except:
         print("Could not start _button_watcher thread; falling back to single-core.")
 
-    # Start in autonomous unless watcher flips us
     while True:
-        print("Main loop iteration. is_config_mode =", is_config_mode)
+        if USER_BUTTON.value() == 0:
+            is_config_mode = True
+            time.sleep(0.2)  # debounce
+
         if is_config_mode:
             print("Entering Configuration Mode")
-            config_mode()   # returns when watcher flips is_config_mode to False
-            # loop continues, next iteration will run autonomous
+            create_ap()
+            start_webserver()
         else:
-            # Autonomous runs one short cycle, then yields back to the loop
-            # so we can react quickly if the watcher flips the mode.
-            # (Avoid a long blocking loop here.)
+            print("Entering Autonomous Mode")
             autonomous_mode()
+            # brief sleep to avoid tight loop
             time.sleep(0.1)
 
 if __name__ == '__main__':
     main()
+
 
