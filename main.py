@@ -3,7 +3,6 @@ import socket
 import time
 from machine import Pin, ADC
 import gc
-import _thread
 from XRPLib.encoded_motor import EncodedMotor
 
 # Initialize hardware
@@ -367,10 +366,6 @@ def main():
     global is_config_mode
 
     print("Starting Pico Web Server...")
-    try:
-        _thread.start_new_thread(_button_watcher, ())
-    except:
-        print("Could not start _button_watcher thread; falling back to single-core.")
 
     # Start in autonomous unless watcher flips us
     while True:
@@ -388,4 +383,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
