@@ -1,55 +1,60 @@
+# MicroPython / uasyncio version (no _thread)
 import network
+import uasyncio as asyncio
 import socket
-import machine
-import time
+import time  # fine to keep, but we won't call time.sleep()
 from machine import Pin, ADC
 import gc
-import _thread
 from XRPLib.encoded_motor import EncodedMotor
 
-# Initialize hardware
-#led = Pin(25, Pin.OUT)  # Built-in LED on Pico
-#adc = ADC(0)  # ADC0 on GP26
-#pump = Pin("LED", Pin.OUT)  # Pump control pin on GP27
+# -------------------------------
+# Global configuration & hardware
+# -------------------------------
 
-# Global variables
-led_state = False
-adc_value = 0
-is_config_mode = False # False = autonomous | True = Config
-moisture_thresholds = [1000, 1000]
-auto_water_seconds = [3.0, 3.0]
-_server_socket_ref = None  # global so watcher can close it
+# False = autonomous | True = Config
+is_config_mode = False
 
+# Two plants by default
+moisture_thresholds = [1000, 1000]      # per-plant soil moisture thresholds
+auto_water_seconds = [3.0, 3.0]         # per-plant pump runtime when dry
+
+_server_obj = None  # asyncio server object (so we can close it cleanly)
 
 # --- Hardware Pin Assignments (update these for your wiring) ---
 PLANT_PINS = [
-    {"led": "LED", "adc": 0, "pump": 3},   # Plant 1: GP2, ADC0, GP3
-    {"led": 4, "adc": 1, "pump": 5},   # Plant 2: GP4, ADC1, GP5
-    # {"led": 6, "adc": 2, "pump": 7},   # Plant 3: GP6, ADC2, GP7
-    # {"led": 8, "adc": 3, "pump": 9},   # Plant 4: GP8, ADC3, GP9
+    {"led": "LED", "adc": 0, "pump": 3},   # Plant 1: LED, ADC0, GP3
+    {"led": 4, "adc": 1, "pump": 5},       # Plant 2: GP4, ADC1, GP5
+    # {"led": 6, "adc": 2, "pump": 7},     # Plant 3 example
+    # {"led": 8, "adc": 3, "pump": 9},     # Plant 4 example
 ]
+
+# NOTE: These pins (36, 44) are board-specific; keep as-is per your original code.
 USER_BUTTON  = Pin(36, Pin.IN, Pin.PULL_UP)
-soil_adc = ADC(Pin(44))        # create an ADC object acting on the soil sensor pin
-val = soil_adc.read_u16()  # read a raw analog value in the range 0-65535
+soil_adc = ADC(Pin(44))                  # example extra ADC; not used below directly
 
 # --- Initialize hardware for all plants ---
-leds = [Pin(p["led"], Pin.OUT) for p in PLANT_PINS]
-adcs = [ADC(p["adc"]) for p in PLANT_PINS]
+leds  = [Pin(p["led"],  Pin.OUT) for p in PLANT_PINS]
+adcs  = [ADC(p["adc"]) for p in PLANT_PINS]
 pumps = [Pin(p["pump"], Pin.OUT) for p in PLANT_PINS]
 
 # --- Global state for all plants ---
-led_states = [False] * 4
-adc_values = [0] * 4
+led_states = [False] * len(PLANT_PINS)
+adc_values = [0]     * len(PLANT_PINS)
 
+# A simple per-plant lock so pump actions don't overlap
+pump_locks = [asyncio.Lock() for _ in PLANT_PINS]
+
+
+# ---------------
+# WiFi / AP utils
+# ---------------
 def create_ap():
-    """Create WiFi Access Point"""
+    """Create WiFi Access Point (blocking until active)"""
     ap = network.WLAN(network.AP_IF)
     ap.active(True)
     ap.config(essid='PicoHotspot', password='12345678')
-    
     while not ap.active():
         pass
-    
     print('Access Point created')
     print('SSID: PicoHotspot')
     print('Password: 12345678')
@@ -57,135 +62,124 @@ def create_ap():
     return ap
 
 
-def autonomous_btn_click():
-    pass
-    
-
+# --------------------
+# HTTP / HTML frontend
+# --------------------
 def generate_html():
+    # (kept your HTML; small IDs could be added to threshold/water inputs if you wire up those JS functions)
     html = """<!DOCTYPE html>
-    <html lang="en">
+<html lang="en">
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body{margin-top: 150px ;background-color: lightgray; display: flex; flex-direction: column; justify-content: center; font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;}
-        .plants-area{display: flex; flex-direction: row; gap: 120px; justify-content: center;}
-        .plant-box{padding: 20px; background-color: white; border: 3px solid grey; border-radius: 8px; display: flex; flex-direction: column}
-        .plant-box header{text-align: center; margin-bottom: 20px; font-size: 20px;}
-        .attribute{display: flex; flex-direction: row; align-items: center}
-        .attribute p{width: 150px; margin-right: 30px;}
-        .attribute input{width: 80px; margin-right: 20px;}
-        .text-box{margin: 10px; border: 3px, solid, grey; border-radius: 5px; padding: 3px;}
-        button{padding: 4px; width: 50px;}
-        button:active{translate: 1px 1px}
-        .start-btn{background-color: orange; border-radius: 3px; border-style: none;}
-        .apply-btn{background-color: lightgreen; border-radius: 3px; border-style: none;}
-        .auto-button{background-color: mediumblue; border-radius: 3px; color: white; width: 120px;height: 80px;}
-        .auto-button-container{display: flex; justify-content: center; margin-top: 20px;}
-    </style>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body{margin-top:150px;background-color:lightgray;display:flex;flex-direction:column;justify-content:center;font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;}
+.plants-area{display:flex;flex-direction:row;gap:120px;justify-content:center;}
+.plant-box{padding:20px;background-color:white;border:3px solid grey;border-radius:8px;display:flex;flex-direction:column}
+.plant-box header{text-align:center;margin-bottom:20px;font-size:20px;}
+.attribute{display:flex;flex-direction:row;align-items:center}
+.attribute p{width:150px;margin-right:30px;}
+.attribute input{width:80px;margin-right:20px;}
+.text-box{margin:10px;border:3px solid grey;border-radius:5px;padding:3px;}
+button{padding:4px;width:50px;}
+button:active{translate:1px 1px}
+.start-btn{background-color:orange;border-radius:3px;border-style:none;}
+.apply-btn{background-color:lightgreen;border-radius:3px;border-style:none;}
+.auto-button{background-color:mediumblue;border-radius:3px;color:white;width:120px;height:80px;}
+.auto-button-container{display:flex;justify-content:center;margin-top:20px;}
+</style>
 </head>
 <body>
-    <div class="plants-area">
-        <div class="plant-box">
-            <header>Plant 1</header>
-            <div class="attribute">
-                <p>Soil moisture:</p>
-                <input class="text-box" type="text" readonly>
-            </div>
-            <div class="attribute">
-                <p>Pump for:</p>
-                <input id="pump0" class="text-box" type="text">
-                <button class="start-btn" onclick="runPump(0)">Start</button>
-            </div>
-            <div class="attribute">
-                <p>Moisture threshold:</p>
-                <input class="text-box" type="text">
-                <button class="apply-btn">Apply</button>
-            </div>
-            <div class="attribute">
-                <p>Water seconds:</p>
-                <input class="text-box" type="text">
-                <button class="apply-btn">Apply</button>
-            </div>
-        </div>
-        <div class="plant-box">
-            <header>Plant 2</header>
-            <div class="attribute">
-                <p>Soil moisture:</p>
-                <input class="text-box" type="text" readonly>
-            </div>
-            <div class="attribute">
-                <p>Pump for:</p>
-                <input id="pump1" class="text-box" type="text">
-                <button class="start-btn" onclick="runPump(1)">Start</button>
-            </div>
-            <div class="attribute">
-                <p>Moisture threshold:</p>
-                <input class="text-box" type="text">
-                <button class="apply-btn">Apply</button>
-            </div>
-            <div class="attribute">
-                <p>Water seconds:</p>
-                <input class="text-box" type="text">
-                <button class="apply-btn">Apply</button>
-            </div>
-        </div>
+<div class="plants-area">
+  <div class="plant-box">
+    <header>Plant 1</header>
+    <div class="attribute">
+      <p>Soil moisture:</p>
+      <input class="text-box" type="text" readonly>
     </div>
-    <div class="auto-button-container">
-        <button class="auto-button">Autonomous Mode</button>
+    <div class="attribute">
+      <p>Pump for:</p>
+      <input id="pump0" class="text-box" type="text">
+      <button class="start-btn" onclick="runPump(0)">Start</button>
     </div>
-        <script>
-            async function runPump(i){
-                const secs = Number(document.getElementById("pump" + i).value || '0');
-                
-                if (isNaN(secs)) {
-                    alert("Please enter a number.");
-                    return;
-                }
-                if (secs <= 0) {
-                    alert("Please enter a number greater than 0.");
-                    return;
-                }
-
-                try {
-                    await fetch('/api/pump/' + i + '/' + secs, { method: 'POST' });
-                } catch (e) {
-                    console.log("Error sending pump request:", e);
-                }
-            }
-
-            async function applyThreshold(i){
-                thresholdValue = Number(document.getElementById("threshold" + i).value);
-
-                try{
-                    await fetch('/api/set_threshold/' + i + '/' + thresholdValue, { method: 'POST' });
-                } catch (e){
-                    console.log("error setting moisture threhold:", e);
-                }
-
-            }
-
-            async function applyWater(i){
-                waterValue = Number(document.getElementById("water" + i).value);
-
-                try{
-                    await fetch('/api/set_water/' + i + '/' + waterValue, { method: 'POST' });
-                } catch (e){
-                    console.log("error setting water duration:", e);
-                }
-
-            }
-        </script>
-    </body>
-    </html>"""
+    <div class="attribute">
+      <p>Moisture threshold:</p>
+      <input id="threshold0" class="text-box" type="text">
+      <button class="apply-btn" onclick="applyThreshold(0)">Apply</button>
+    </div>
+    <div class="attribute">
+      <p>Water seconds:</p>
+      <input id="water0" class="text-box" type="text">
+      <button class="apply-btn" onclick="applyWater(0)">Apply</button>
+    </div>
+  </div>
+  <div class="plant-box">
+    <header>Plant 2</header>
+    <div class="attribute">
+      <p>Soil moisture:</p>
+      <input class="text-box" type="text" readonly>
+    </div>
+    <div class="attribute">
+      <p>Pump for:</p>
+      <input id="pump1" class="text-box" type="text">
+      <button class="start-btn" onclick="runPump(1)">Start</button>
+    </div>
+    <div class="attribute">
+      <p>Moisture threshold:</p>
+      <input id="threshold1" class="text-box" type="text">
+      <button class="apply-btn" onclick="applyThreshold(1)">Apply</button>
+    </div>
+    <div class="attribute">
+      <p>Water seconds:</p>
+      <input id="water1" class="text-box" type="text">
+      <button class="apply-btn" onclick="applyWater(1)">Apply</button>
+    </div>
+  </div>
+</div>
+<div class="auto-button-container">
+  <button class="auto-button" onclick="toggleAutonomous()">Autonomous Mode</button>
+</div>
+<script>
+async function runPump(i){
+  const secs = Number(document.getElementById("pump" + i).value || '0');
+  if (isNaN(secs)){ alert("Please enter a number."); return; }
+  if (secs <= 0){ alert("Please enter a number greater than 0."); return; }
+  try { await fetch('/api/pump/' + i + '/' + secs, { method: 'POST' }); }
+  catch(e){ console.log("Error sending pump request:", e); }
+}
+async function applyThreshold(i){
+  const v = Number(document.getElementById("threshold" + i).value);
+  if (isNaN(v)){ alert("Enter a number"); return; }
+  try { await fetch('/api/set_threshold/' + i + '/' + v, { method: 'POST' }); }
+  catch(e){ console.log("error setting moisture threshold:", e); }
+}
+async function applyWater(i){
+  const v = Number(document.getElementById("water" + i).value);
+  if (isNaN(v) || v < 0){ alert("Enter a non-negative number"); return; }
+  try { await fetch('/api/set_water/' + i + '/' + v, { method: 'POST' }); }
+  catch(e){ console.log("error setting water duration:", e); }
+}
+async function toggleAutonomous(){
+  try { await fetch('/api/toggle_mode', { method: 'POST' }); }
+  catch(e){ console.log("error toggling mode:", e); }
+}
+</script>
+</body>
+</html>"""
     return html
 
-def handle_request(client_socket):
+
+async def handle_client(reader, writer):
+    """Async HTTP 1.0/1.1 handler (very small, just enough for this UI)."""
     try:
-        req = client_socket.recv(1024).decode()
+        req = await reader.read(1024)
         if not req:
             return
+        try:
+            req_s = req.decode()
+        except:
+            req_s = str(req)
 
-        first_line = req.split('\n', 1)[0].strip()  # "POST /api/pump/0/2 HTTP/1.1"
+        first_line = req_s.split('\n', 1)[0].strip()  # "POST /api/pump/0/2 HTTP/1.1"
         parts = first_line.split()
         if len(parts) < 2:
             return
@@ -193,192 +187,245 @@ def handle_request(client_socket):
 
         # Serve HTML
         if method == 'GET' and path == '/':
-            response = 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n'
-            response += generate_html()
-            client_socket.send(response.encode())
+            body = generate_html()
+            resp = (
+                'HTTP/1.1 200 OK\r\n'
+                'Content-Type: text/html\r\n'
+                'Connection: close\r\n\r\n' + body
+            )
+            writer.write(resp.encode())
+            await writer.drain()
             return
 
-        # API: pump
+        # Toggle mode (UI button) — flips to autonomous and button task will also work
+        if method == 'POST' and path == '/api/toggle_mode':
+            global is_config_mode
+            is_config_mode = not is_config_mode
+            writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
+            await writer.drain()
+            return
+
+        # API: pump (indexes 0..N-1)
         if method == 'POST' and path.startswith('/api/pump/'):
             try:
                 _, _, _, idx_str, sec_str = path.split('/')
-                print("starting pump")
                 idx = int(idx_str)
-                print(idx)
                 secs = float(sec_str)
-                if idx < 0 or idx > 1:
+                if idx < 0 or idx >= len(PLANT_PINS):
                     raise ValueError('bad plant index')
-                
-                print("idx: ", idx)
+                if secs <= 0:
+                    raise ValueError('seconds must be > 0')
 
-                motor = EncodedMotor.get_default_encoded_motor(idx+1)
-                print(idx)
-                motor.set_effort(1.0)
-                time.sleep(secs)
-                motor.set_effort(0.0)
+                async with pump_locks[idx]:
+                    motor = EncodedMotor.get_default_encoded_motor(idx + 1)
+                    motor.set_effort(1.0)
+                    await asyncio.sleep(secs)
+                    motor.set_effort(0.0)
 
-                client_socket.send(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
+                writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
             except Exception as e:
                 print('pump route error:', e)
-                client_socket.send(b'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nERR')
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nERR')
+            await writer.drain()
             return
-        
+
         # API: set per-plant moisture threshold
         if method == 'POST' and path.startswith('/api/set_threshold/'):
             try:
                 _, _, _, idx_str, val_str = path.split('/')
-                idx = int(idx_str)  
+                idx = int(idx_str)
                 threshold_val = int(val_str)
-                if idx < 1 or idx > 2: raise ValueError('bad plant index')
-                moisture_thresholds[idx-1] = threshold_val
-                client_socket.send(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
+                if idx < 0 or idx >= len(moisture_thresholds):
+                    raise ValueError('bad plant index')  # FIX: accept 0-based indices
+                moisture_thresholds[idx] = threshold_val
+                writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
             except Exception as e:
                 print('set_threshold error:', e)
-                client_socket.send(b'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nERR')
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nERR')
+            await writer.drain()
             return
-        
+
         # API: set per-plant autonomous watering duration (seconds)
         if method == 'POST' and path.startswith('/api/set_water/'):
             try:
                 _, _, _, idx_str, val_str = path.split('/')
                 idx = int(idx_str)
                 water_secs = float(val_str)
-                if idx < 1 or idx > 2: raise ValueError('bad plant index')
-                if secs < 0: raise ValueError('PLease enter non-negative seconds')
-                auto_water_seconds[idx-1] = water_secs
-                client_socket.send(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
+                if idx < 0 or idx >= len(auto_water_seconds):
+                    raise ValueError('bad plant index')  # FIX: accept 0-based indices
+                if water_secs < 0:
+                    raise ValueError('Please enter non-negative seconds')  # FIX: variable name
+                auto_water_seconds[idx] = water_secs
+                writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
             except Exception as e:
                 print('set_water error:', e)
-                client_socket.send(b'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nERR')
+                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nERR')
+            await writer.drain()
             return
 
-        client_socket.send(b'HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNot Found')
+        # Not found
+        writer.write(b'HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNot Found')
+        await writer.drain()
 
     except Exception as e:
-        print(f"Error handling request: {e}")
-    finally:
-        try: client_socket.close()
-        except: pass
-        
-
-def _button_watcher():
-    global is_config_mode, _server_socket_ref
-    last = 1
-    pressed_count = 0
-    while True:
-        val = USER_BUTTON.value()  # 0 when pressed (pull-up)
-        if val == 0 and last == 1:
-            # simple debounce: wait ~50ms confirming
-            time.sleep(0.05)
-            if USER_BUTTON.value() == 0:
-                print("Button pressed -> leaving config mode")
-                is_config_mode = False
-                # Close the server socket to unblock accept()
-                try:
-                    if _server_socket_ref:
-                        _server_socket_ref.close()
-                except:
-                    pass
-        last = val
-        time.sleep(0.02)
-
-def start_webserver():
-    """Start the web server"""
-    global is_config_mode, _server_socket_ref
-
-    addr = socket.getaddrinfo('0.0.0.0', 80)[0][-1]
-    server_socket = socket.socket()
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(addr)
-    server_socket.listen(2)
-
-    _server_socket_ref = server_socket
-
-    print('Web server started on port 80')
-    print('Connect to PicoHotspot WiFi and visit: http://192.168.4.1')
-
-    try:
-        while is_config_mode:
-            try:
-                client_socket, addr = server_socket.accept()  # may be unblocked by close()
-            except OSError as e:
-                # When closed from the watcher, accept() throws; exit loop
-                break
-
-            try:
-                print(f'Client connected from {addr}')
-                handle_request(client_socket)
-            finally:
-                try:
-                    client_socket.close()
-                except:
-                    pass
-
-            gc.collect()
+        print("Error handling request:", e)
     finally:
         try:
-            server_socket.close()
+            await writer.drain()
         except:
             pass
-        _server_socket_ref = None
-            
-def config_mode():
-    """Configuration mode"""
-    
-    for i in range(len(PLANT_PINS)):
-        motor = EncodedMotor.get_default_encoded_motor(i+1)
-        motor.set_effort(0.0)
+        try:
+            # Some MicroPython builds may not have wait_closed(); ignore if so
+            await writer.wait_closed()
+        except:
+            try:
+                writer.close()
+            except:
+                pass
 
-    
-    # Creates the access point
-    create_ap()
-    
-    # Starts the web server
-    start_webserver()
-    
-def autonomous_mode():
-    """Autonomous mode"""
-    global adc_values, led_states, led_state, adc_value
-    
-    # while not is_config_mode:
-    for i in range(len(PLANT_PINS)):
-        adc_values[i] = adcs[i].read_u16()
-        print(f"Plant {i+1} ADC Value: {adc_values[i]}")
-        
-        if adc_values[i] < moisture_thresholds[i]:
-            print(f"Plant {i+1} soil is dry. Activating pump for {auto_water_seconds[i]} seconds.")
-            motor = EncodedMotor.get_default_encoded_motor(i+1)
-            motor.set_effort(1.0)
-            time.sleep(auto_water_seconds[i])
-            motor.set_effort(0.0)
-    
 
-def main():
-    global is_config_mode
+# -----------------------
+# Mode handlers (asyncio)
+# -----------------------
+async def start_webserver():
+    """Start async web server on port 80 (returns server object)."""
+    print('Web server starting on port 80...')
+    server = await asyncio.start_server(handle_client, '0.0.0.0', 80, backlog=2)
+    print('Web server started. Visit: http://192.168.4.1')
+    return server
 
-    print("Starting Pico Web Server...")
-    # start watcher thread once
+
+async def stop_webserver(server):
+    """Stop the async web server cleanly."""
     try:
-        _thread.start_new_thread(_button_watcher, ())
-    except:
-        print("Could not start _button_watcher thread; falling back to single-core.")
+        print("Stopping web server...")
+        server.close()
+        await server.wait_closed()
+        print("Web server stopped.")
+    except Exception as e:
+        print("Error stopping server:", e)
+
+
+async def config_mode_task():
+    """Run configuration mode: bring up AP and serve the UI until mode flips false."""
+    global _server_obj
+
+    # Ensure all pumps off when entering config
+    for i in range(len(PLANT_PINS)):
+        try:
+            motor = EncodedMotor.get_default_encoded_motor(i + 1)
+            motor.set_effort(0.0)
+        except Exception as e:
+            print("Motor init off error:", e)
+
+    ap = create_ap()
+
+    # Start server
+    _server_obj = await start_webserver()
+
+    try:
+        # Poll until mode flips off (button task or UI endpoint will flip)
+        while is_config_mode:
+            await asyncio.sleep(0.2)
+            gc.collect()
+    finally:
+        # Stop server and AP
+        if _server_obj:
+            await stop_webserver(_server_obj)
+            _server_obj = None
+        try:
+            ap.active(False)
+            print("AP deactivated")
+        except:
+            pass
+
+
+async def autonomous_cycle_once():
+    """One short autonomous scan of all plants."""
+    for i in range(len(PLANT_PINS)):
+        try:
+            adc_values[i] = adcs[i].read_u16()
+        except Exception as e:
+            print("ADC read fail plant", i, e)
+            adc_values[i] = 0
+
+        print(f"Plant {i+1} ADC Value: {adc_values[i]} (threshold {moisture_thresholds[i]})")
+
+        if adc_values[i] < moisture_thresholds[i]:
+            # Soil is "dry" by your convention: lower value = drier.
+            secs = float(auto_water_seconds[i])
+            print(f"Plant {i+1} soil is dry. Activating pump for {secs} seconds.")
+            try:
+                async with pump_locks[i]:
+                    motor = EncodedMotor.get_default_encoded_motor(i + 1)
+                    motor.set_effort(1.0)
+                    await asyncio.sleep(secs)
+                    motor.set_effort(0.0)
+            except Exception as e:
+                print("Pump error:", e)
+
+
+# -------------------
+# Button watcher task
+# -------------------
+async def button_watcher():
+    """Poll a pull-up button; short press toggles config/autonomous."""
+    global is_config_mode
+    last = 1
 
     while True:
-        if USER_BUTTON.value() == 0:
-            is_config_mode = True
-            time.sleep(0.2)  # debounce
+        try:
+            val = USER_BUTTON.value()  # 0 when pressed
+            # simple edge detect w/ debounce
+            if val == 0 and last == 1:
+                await asyncio.sleep_ms(50)
+                if USER_BUTTON.value() == 0:
+                    is_config_mode = not is_config_mode
+                    print("Button pressed -> is_config_mode:", is_config_mode)
+                    # wait for release
+                    while USER_BUTTON.value() == 0:
+                        await asyncio.sleep_ms(10)
+            last = val
+        except Exception as e:
+            print("Button watcher error:", e)
+        await asyncio.sleep_ms(20)
+
+
+# -----
+# main
+# -----
+async def main():
+    global is_config_mode
+
+    print("Starting Pico (u)asyncio app...")
+
+    # Kick off the button watcher (no threads)
+    asyncio.create_task(button_watcher())
+
+    # Start in autonomous unless user flips the mode
+    while True:
+        print("Main loop. is_config_mode =", is_config_mode)
 
         if is_config_mode:
             print("Entering Configuration Mode")
-            create_ap()
-            start_webserver()
+            await config_mode_task()  # returns when mode flips to False
+            # loop continues, next iteration will run autonomous
         else:
-            print("Entering Autonomous Mode")
-            autonomous_mode()
-            # brief sleep to avoid tight loop
-            time.sleep(0.1)
+            # Run a single quick autonomous cycle, then yield back to loop
+            await autonomous_cycle_once()
+            await asyncio.sleep(0.1)
 
-if __name__ == '__main__':
-    main()
+        gc.collect()
 
 
+# Entry point
+try:
+    asyncio.run(main())
+finally:
+    # Ensure pumps off if we ever exit
+    try:
+        for i in range(len(PLANT_PINS)):
+            motor = EncodedMotor.get_default_encoded_motor(i + 1)
+            motor.set_effort(0.0)
+    except:
+        pass
