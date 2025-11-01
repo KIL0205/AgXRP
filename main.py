@@ -6,6 +6,7 @@ import time  # fine to keep, but we won't call time.sleep()
 from machine import Pin, ADC
 import gc
 from XRPLib.encoded_motor import EncodedMotor
+from XRPLib.board import Board
 
 # -------------------------------
 # Global configuration & hardware
@@ -43,6 +44,9 @@ adc_values = [0]     * len(PLANT_PINS)
 
 # A simple per-plant lock so pump actions don't overlap
 pump_locks = [asyncio.Lock() for _ in PLANT_PINS]
+
+
+board = Board.get_default_board()
 
 def _send_json(sock, obj, code=200):
     import json
@@ -455,10 +459,12 @@ async def main():
 
         if is_config_mode:
             print("Entering Configuration Mode")
+            board.led_on()
             await config_mode_task()  # returns when mode flips to False
             # loop continues, next iteration will run autonomous
         else:
             # Run a single quick autonomous cycle, then yield back to loop
+            board.led_off()
             await autonomous_cycle_once()
             await asyncio.sleep(0.1)
 
