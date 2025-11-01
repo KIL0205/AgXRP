@@ -6,7 +6,6 @@ import time  # fine to keep, but we won't call time.sleep()
 from machine import Pin, ADC
 import gc
 from XRPLib.encoded_motor import EncodedMotor
-from XRPLib.board import Board
 
 # -------------------------------
 # Global configuration & hardware
@@ -31,7 +30,7 @@ PLANT_PINS = [
 
 # NOTE: These pins (36, 44) are board-specific; keep as-is per your original code.
 USER_BUTTON  = Pin(36, Pin.IN, Pin.PULL_UP)
-SOIL_ADCs = [ADC(Pin(44)), ADC(Pin(45)) ]       # create ADC objects acting on the soil sensor pins
+soil_adc = ADC(Pin(44))                  # example extra ADC; not used below directly
 
 # --- Initialize hardware for all plants ---
 leds  = [Pin(p["led"],  Pin.OUT) for p in PLANT_PINS]
@@ -46,19 +45,6 @@ adc_values = [0]     * len(PLANT_PINS)
 pump_locks = [asyncio.Lock() for _ in PLANT_PINS]
 
 
-board = Board.get_default_board()
-
-def _send_json(sock, obj, code=200):
-    import json
-    body = json.dumps(obj).encode()
-    hdr = (
-        f"HTTP/1.1 {code} OK\r\n"
-        "Content-Type: application/json\r\n"
-        "Cache-Control: no-store\r\n"
-        "Connection: close\r\n\r\n"
-    ).encode()
-    sock.send(hdr + body)  
-    
 # ---------------
 # WiFi / AP utils
 # ---------------
@@ -108,7 +94,7 @@ button:active{translate:1px 1px}
     <header>Plant 1</header>
     <div class="attribute">
       <p>Soil moisture:</p>
-      <input id="soil-field0" class="text-box" type="text" readonly>
+      <input class="text-box" type="text" readonly>
     </div>
     <div class="attribute">
       <p>Pump for:</p>
@@ -130,7 +116,7 @@ button:active{translate:1px 1px}
     <header>Plant 2</header>
     <div class="attribute">
       <p>Soil moisture:</p>
-      <input id="soil-field1" class="text-box" type="text" readonly>
+      <input class="text-box" type="text" readonly>
     </div>
     <div class="attribute">
       <p>Pump for:</p>
@@ -172,21 +158,6 @@ async function applyWater(i){
   try { await fetch('/api/set_water/' + i + '/' + v, { method: 'POST' }); }
   catch(e){ console.log("error setting water duration:", e); }
 }
- async function updateSoil(i){
-                try{
-                    const res = await fetch('/api/update_soil/' + i, { method: 'GET' });
-                    const json_res = await res.json();
-                    document.getElementById("soil-field" + i).value = json_res.raw;
-                } catch (e){
-                    console.log("error updating soil moisture: ", e)
-                }
-            }
-
-            setInterval(() => updateSoil(0), 1000);
-            setInterval(() => updateSoil(1), 1000);
-            updateSoil(0);
-            updateSoil(1);
-        
 async function toggleAutonomous(){
   try { await fetch('/api/toggle_mode', { method: 'POST' }); }
   catch(e){ console.log("error toggling mode:", e); }
@@ -233,28 +204,6 @@ async def handle_client(reader, writer):
             writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
             await writer.drain()
             return
-        
-        #API: get soil moisture
-        if method == 'GET' and path.startswith('/api/update_soil/'):
-            try:
-                _, _, _, idx_str = path.split('/')
-                idx = int(idx_str)
-                if idx < 0 or idx >= len(SOIL_ADCs): raise ValueError('bad plant index')
-                raw_val = SOIL_ADCs[idx].read_u16()
-                import json
-                body = json.dumps({"raw": raw_val}).encode()
-                hdr = (
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Cache-Control: no-store\r\n"
-                    "Connection: close\r\n\r\n"
-                ).encode()
-                writer.write(hdr + body)
-            except Exception as e:
-                print('error reading soil sensor', e)
-                writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nERR')
-            await writer.drain()
-            return
 
         # API: pump (indexes 0..N-1)
         if method == 'POST' and path.startswith('/api/pump/'):
@@ -287,7 +236,7 @@ async def handle_client(reader, writer):
                 idx = int(idx_str)
                 threshold_val = int(val_str)
                 if idx < 0 or idx >= len(moisture_thresholds):
-                    raise ValueError('bad plant index') 
+                    raise ValueError('bad plant index')  # FIX: accept 0-based indices
                 moisture_thresholds[idx] = threshold_val
                 writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK')
             except Exception as e:
@@ -303,7 +252,7 @@ async def handle_client(reader, writer):
                 idx = int(idx_str)
                 water_secs = float(val_str)
                 if idx < 0 or idx >= len(auto_water_seconds):
-                    raise ValueError('bad plant index')
+                    raise ValueError('bad plant index')  # FIX: accept 0-based indices
                 if water_secs < 0:
                     raise ValueError('Please enter non-negative seconds')  # FIX: variable name
                 auto_water_seconds[idx] = water_secs
@@ -395,7 +344,7 @@ async def autonomous_cycle_once():
     """One short autonomous scan of all plants."""
     for i in range(len(PLANT_PINS)):
         try:
-            adc_values[i] = SOIL_ADCs[i].read_u16()
+            adc_values[i] = adcs[i].read_u16()
         except Exception as e:
             print("ADC read fail plant", i, e)
             adc_values[i] = 0
@@ -459,12 +408,10 @@ async def main():
 
         if is_config_mode:
             print("Entering Configuration Mode")
-            board.led_on()
             await config_mode_task()  # returns when mode flips to False
             # loop continues, next iteration will run autonomous
         else:
             # Run a single quick autonomous cycle, then yield back to loop
-            board.led_off()
             await autonomous_cycle_once()
             await asyncio.sleep(0.1)
 
@@ -482,5 +429,3 @@ finally:
             motor.set_effort(0.0)
     except:
         pass
-
-
