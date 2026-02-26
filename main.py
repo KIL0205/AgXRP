@@ -30,7 +30,7 @@ PLANT_PINS = [
 ]
 
 # NOTE: These pins (36, 44) are board-specific; keep as-is per your original code.
-USER_BUTTON  = Pin(36, Pin.IN, Pin.PULL_UP)
+USER_BUTTON  = Pin(36, Pin.IN, Pin.PULL_UP) #pin 36 is the USER button on the XRP Control board
 SOIL_ADCs = [ADC(Pin(44)), ADC(Pin(45)) ]       # create ADC objects acting on the soil sensor pins
 
 # --- Initialize hardware for all plants ---
@@ -66,12 +66,12 @@ def create_ap():
     """Create WiFi Access Point (blocking until active)"""
     ap = network.WLAN(network.AP_IF)
     ap.active(True)
-    ap.config(essid='PicoHotspot', password='12345678')
+    ap.config(essid='AgXrpHotspot', password='sensor123')
     while not ap.active():
         pass
     print('Access Point created')
-    print('SSID: PicoHotspot')
-    print('Password: 12345678')
+    print('SSID: AgXrpHotspot')
+    print('Password: sensor123')
     print('IP Address:', ap.ifconfig()[0])
     return ap
 
@@ -482,5 +482,3 @@ finally:
             motor.set_effort(0.0)
     except:
         pass
-
-
