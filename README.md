@@ -40,8 +40,8 @@ This MicroPython project creates a WiFi hotspot on the Raspberry Pi Pico and ser
 ### 3. Connect to the Hotspot
 
 1. Power on the Pico
-2. Look for a WiFi network named "PicoHotspot"
-3. Connect to it using password: `12345678`
+2. Look for a WiFi network named "AgXRPHotspot"
+3. Connect to it using password: `sensor123`
 4. Open a web browser and navigate to: `http://192.168.4.1`
 
 ## Usage
